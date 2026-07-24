@@ -13,7 +13,9 @@ that hides the difficult parts of file persistence:
 - configurable rolling backups.
 
 The package is intentionally domain-agnostic. Callers provide the Pydantic model,
-CSV fields, ID policy, sort order, and optional candidate validator.
+CSV fields, ID policy, sort order, and optional candidate validator. For the
+0.1.x contract, `fieldnames` must exactly cover `model_type.model_fields`; fields
+cannot be silently omitted or added as unknown CSV columns.
 
 ## Requirements
 
@@ -96,7 +98,10 @@ repository = CsvRepository(
 ```
 
 An encoder must return `str`; a decoder receives the raw CSV text and returns
-the Python value that should be passed to Pydantic validation.
+the Python value that should be passed to Pydantic validation. Before a write is
+committed, the temporary CSV is decoded and validated through the repository's
+own read path. The decoded snapshot must be semantically equal to the normalized
+input snapshot, so lossy codecs are rejected before replacement.
 
 ## Frictionless validation
 
@@ -114,6 +119,8 @@ repository = CsvRepository(
 ```
 
 Validators must raise `DataValidationError` when a candidate is invalid.
+Candidate validators are expected to be read-only; codec/Pydantic round-trip
+validation remains the repository's responsibility.
 
 ## Persistence guarantees
 
@@ -128,9 +135,11 @@ If the replacement succeeds but the parent-directory `fsync` fails, the
 repository raises `CommitDurabilityError` and explicitly reports that the file
 may already be committed. Callers must inspect the file before retrying.
 
-The repository expects the CSV file to exist before the first read or write. The
-caller owns initial file creation and schema migration. `update()` never performs
-an implicit insert, and `delete()` returns `False` when the ID does not exist.
+`create()`, `update()`, and `delete()` require the CSV file to exist because they
+read the current snapshot first. `replace_all()` may initialize a missing CSV
+file, which is useful for migrations and recovery. The caller owns schema
+migration. `update()` never performs an implicit insert, and `delete()` returns
+`False` when the ID does not exist.
 
 ## Development
 

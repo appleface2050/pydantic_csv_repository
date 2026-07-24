@@ -50,6 +50,29 @@ class NullableItem(BaseModel):
     tags: list[str] = []
 
 
+class TextItem(BaseModel):
+    """Record used to test lossy text codecs."""
+
+    id: int = 0
+    note: str
+
+
+class RequiredFieldItem(BaseModel):
+    """Record with a required field that must not be silently omitted."""
+
+    id: int = 0
+    name: str
+    secret: str
+
+
+class DefaultedFieldItem(BaseModel):
+    """Record with a defaulted field that must not be silently omitted."""
+
+    id: int = 0
+    name: str
+    metadata: str = "default"
+
+
 SCHEMA = {
     "fields": [
         {"name": "id", "type": "integer", "constraints": {"required": True}},
@@ -258,6 +281,109 @@ def test_json_codecs_preserve_nullable_and_structured_values(tmp_path):
     assert repository.all() == [created]
     assert repository.all()[0].note is None
     assert repository.all()[0].tags == ["alpha", "beta"]
+
+
+def test_bad_codec_decoder_is_rejected_before_replace(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,note,tags\n", encoding="utf-8")
+    bad_codec = FieldCodec(
+        encode=lambda value: json.dumps(value),
+        decode=lambda _text: (_ for _ in ()).throw(ValueError("bad decoder")),
+    )
+    repository = _build_nullable_repository(
+        path,
+        field_codecs={"note": FieldCodec(encode=str, decode=int), "tags": bad_codec},
+    )
+
+    with pytest.raises(DataValidationError, match="field decoding failed"):
+        repository.create(NullableItem(note=1, tags=["alpha"]))
+
+    assert path.read_text(encoding="utf-8") == "id,note,tags\n"
+
+
+def test_codec_decode_result_must_pass_pydantic_before_replace(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,note,tags\n", encoding="utf-8")
+    invalid_note_codec = FieldCodec(
+        encode=str,
+        decode=lambda _text: "not-an-int",
+    )
+    json_codec = FieldCodec(
+        encode=lambda value: json.dumps(value),
+        decode=json.loads,
+    )
+    repository = _build_nullable_repository(
+        path,
+        field_codecs={"note": invalid_note_codec, "tags": json_codec},
+    )
+
+    with pytest.raises(DataValidationError, match="Record validation failed"):
+        repository.create(NullableItem(note=1, tags=[]))
+
+    assert repository.all() == []
+
+
+def test_lossy_codec_is_rejected_before_replace(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,note\n", encoding="utf-8")
+    lossy_codec = FieldCodec(encode=str.upper, decode=str.lower)
+    repository = CsvRepository(
+        path=path,
+        model_type=TextItem,
+        fieldnames=("id", "note"),
+        id_field="id",
+        id_factory=lambda records: max((item.id for item in records), default=0) + 1,
+        is_empty_id=lambda record_id: record_id == 0,
+        field_codecs={"note": lossy_codec},
+    )
+
+    with pytest.raises(DataValidationError, match="round-trip changed"):
+        repository.create(TextItem(note="MiXeD"))
+
+    assert repository.all() == []
+
+
+@pytest.mark.parametrize(
+    ("model_type", "fieldnames"),
+    [
+        (RequiredFieldItem, ("id", "name")),
+        (DefaultedFieldItem, ("id", "name")),
+        (Item, ("id", "name", "value", "legacy")),
+    ],
+)
+def test_fieldnames_must_exactly_cover_model_fields(tmp_path, model_type, fieldnames):
+    with pytest.raises(ValueError, match="fieldnames must exactly cover model fields"):
+        CsvRepository(
+            path=tmp_path / "items.csv",
+            model_type=model_type,
+            fieldnames=fieldnames,
+            id_field="id",
+            id_factory=lambda records: 1,
+            is_empty_id=lambda record_id: record_id == 0,
+        )
+
+
+def test_strict_csv_parser_rejects_malformed_quoted_field(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text('id,name,value\n1,"a"b,2\n', encoding="utf-8")
+    repository = _build_repository(path)
+
+    with pytest.raises(DataValidationError):
+        repository.all()
+
+
+def test_file_mode_is_applied_before_file_fsync(tmp_path, monkeypatch):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n", encoding="utf-8")
+    repository = _build_repository(path)
+    events = []
+
+    monkeypatch.setattr(os, "fchmod", lambda _fd, _mode: events.append("fchmod"))
+    monkeypatch.setattr(os, "fsync", lambda _fd: events.append("fsync"))
+
+    repository.create(Item(name="alpha", value=1))
+
+    assert events[:2] == ["fchmod", "fsync"]
 
 
 def test_read_rejects_extra_csv_columns_before_any_write(tmp_path):

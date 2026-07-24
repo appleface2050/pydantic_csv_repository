@@ -67,6 +67,8 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
         default_file_mode: int = 0o600,
     ) -> None:
         normalized_fieldnames = tuple(fieldnames)
+        if not isinstance(model_type, type) or not issubclass(model_type, BaseModel):
+            raise ValueError("model_type must be a Pydantic BaseModel subclass")
         model_fields = set(model_type.model_fields)
         if not normalized_fieldnames:
             raise ValueError("fieldnames cannot be empty")
@@ -75,16 +77,29 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
         fieldname_set = set(normalized_fieldnames)
         if len(fieldname_set) != len(normalized_fieldnames):
             raise ValueError("fieldnames contains duplicates")
+        missing_model_fields = model_fields - fieldname_set
+        unknown_model_fields = fieldname_set - model_fields
+        if missing_model_fields or unknown_model_fields:
+            raise ValueError(
+                "fieldnames must exactly cover model fields; "
+                f"missing={sorted(missing_model_fields)}, unknown={sorted(unknown_model_fields)}"
+            )
         if id_field not in normalized_fieldnames:
             raise ValueError(f"id_field is not in CSV fields: {id_field}")
         if id_field not in model_fields:
             raise ValueError(f"id_field is not a model field: {id_field}")
-        if not isinstance(backup_limit, int) or backup_limit < 0:
+        if isinstance(backup_limit, bool) or not isinstance(backup_limit, int) or backup_limit < 0:
             raise ValueError("backup_limit must be a non-negative integer")
-        if not isinstance(default_file_mode, int) or not 0 <= default_file_mode <= 0o777:
+        if isinstance(default_file_mode, bool) or not isinstance(default_file_mode, int):
+            raise ValueError("default_file_mode must be an integer")
+        if not 0 <= default_file_mode <= 0o777:
             raise ValueError("default_file_mode must be between 0 and 0o777")
         if not callable(id_factory) or not callable(is_empty_id):
             raise ValueError("id_factory and is_empty_id must be callable")
+        if sort_key is not None and not callable(sort_key):
+            raise ValueError("sort_key must be callable")
+        if candidate_validator is not None and not callable(candidate_validator):
+            raise ValueError("candidate_validator must be callable")
 
         normalized_unique_keys = tuple(tuple(key) for key in unique_keys)
         for key in normalized_unique_keys:
@@ -195,15 +210,23 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read_unlocked(self) -> list[ModelT]:
-        if not self.path.exists():
-            raise DataValidationError(f"CSV file does not exist: {self.path}")
+        return self._read_path_unlocked(self.path, run_candidate_validator=True)
 
+    def _read_path_unlocked(
+        self,
+        path: Path,
+        *,
+        run_candidate_validator: bool,
+    ) -> list[ModelT]:
+        """Read one CSV path through the complete repository decoding pipeline."""
+        if not path.exists():
+            raise DataValidationError(f"CSV file does not exist: {path}")
         try:
-            if self.candidate_validator is not None:
-                self.candidate_validator(self.path)
+            if run_candidate_validator and self.candidate_validator is not None:
+                self.candidate_validator(path)
 
-            with self.path.open("r", newline="", encoding="utf-8-sig") as csv_file:
-                reader = csv.DictReader(csv_file)
+            with path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+                reader = csv.DictReader(csv_file, strict=True)
                 actual_fields = tuple(reader.fieldnames or ())
                 if actual_fields != self.fieldnames:
                     raise DataValidationError(
@@ -229,11 +252,16 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
         except (DataValidationError, RecordConflictError):
             raise
         except (OSError, csv.Error, ValidationError) as exc:
-            raise DataValidationError(f"Failed to read CSV: {self.path}: {exc}") from exc
+            raise DataValidationError(f"Failed to read CSV: {path}: {exc}") from exc
         except Exception as exc:
-            raise DataValidationError(f"Failed to read CSV: {self.path}: {exc}") from exc
+            raise DataValidationError(f"Failed to read CSV: {path}: {exc}") from exc
 
-        self._validate_records(records)
+        try:
+            self._validate_records(records)
+        except (DataValidationError, RecordConflictError):
+            raise
+        except Exception as exc:
+            raise DataValidationError(f"Failed to validate CSV records: {path}: {exc}") from exc
         return records
 
     def _write_candidate_unlocked(self, records: list[ModelT]) -> list[ModelT]:
@@ -274,12 +302,17 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
                 writer.writeheader()
                 for record in normalized_records:
                     writer.writerow(self._serialize(record))
+                os.fchmod(temporary_file.fileno(), existing_mode)
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
 
             if self.candidate_validator is not None:
                 self.candidate_validator(temporary_path)
-            os.chmod(temporary_path, existing_mode)
+            candidate_records = self._read_path_unlocked(
+                temporary_path,
+                run_candidate_validator=False,
+            )
+            self._assert_round_trip(normalized_records, candidate_records)
             self._backup_unlocked()
             os.replace(temporary_path, self.path)
             temporary_path = None
@@ -298,7 +331,7 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
 
-        return normalized_records
+        return candidate_records
 
     def _normalize_record(self, record: Any) -> ModelT:
         try:
@@ -332,6 +365,26 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
             raise DataValidationError(
                 f"CSV row {line_number} field decoding failed: {exc}"
             ) from exc
+
+    def _assert_round_trip(
+        self,
+        expected_records: Sequence[ModelT],
+        decoded_records: Sequence[ModelT],
+    ) -> None:
+        """Reject codecs whose persisted representation changes model semantics."""
+        expected_values = [
+            record.model_dump(mode="python", round_trip=True)
+            for record in expected_records
+        ]
+        decoded_values = [
+            record.model_dump(mode="python", round_trip=True)
+            for record in decoded_records
+        ]
+        if expected_values != decoded_values:
+            raise DataValidationError(
+                "CSV codec round-trip changed the normalized snapshot; "
+                "encode/decode must preserve model semantics"
+            )
 
     def _validate_records(self, records: Sequence[ModelT]) -> None:
         seen_ids: set[Any] = set()
