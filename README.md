@@ -25,7 +25,15 @@ construction in 0.1.x; use ordinary model field names for the persisted schema.
 - Pydantic 2.x
 - Linux or macOS (the implementation uses POSIX `fcntl.flock`)
 
-Install the core package:
+Version 0.1.0 has passed external review and is approved for release. It is
+currently maintained in GitHub and has not yet been published to PyPI. Until
+then, install the package directly from the repository:
+
+```bash
+pip install "git+https://github.com/appleface2050/pydantic_csv_repository.git"
+```
+
+After PyPI publication, install the core package with:
 
 ```bash
 pip install pydantic-csv-repository
