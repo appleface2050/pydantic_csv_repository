@@ -69,6 +69,35 @@ assert created.id == 1
 assert repository.get(1) == created
 ```
 
+## Field codecs
+
+Fields without a codec use the legacy scalar CSV representation. Pydantic can
+parse the stored text back into common scalar fields such as `str`, `int`,
+`float`, and `bool`.
+
+`None` values and structured values such as lists, dictionaries, and nested
+models must use an explicit `FieldCodec`. This prevents ambiguous or lossy
+serialization:
+
+```python
+import json
+
+from pydantic_csv_repository import FieldCodec
+
+json_codec = FieldCodec(
+    encode=lambda value: json.dumps(value, ensure_ascii=False),
+    decode=json.loads,
+)
+
+repository = CsvRepository(
+    # ...other arguments...
+    field_codecs={"metadata": json_codec},
+)
+```
+
+An encoder must return `str`; a decoder receives the raw CSV text and returns
+the Python value that should be passed to Pydantic validation.
+
 ## Frictionless validation
 
 `FrictionlessResourceValidator` adapts a Frictionless Table Schema to the
@@ -91,7 +120,13 @@ Validators must raise `DataValidationError` when a candidate is invalid.
 Each repository uses a lock file next to the data file. A write is serialized,
 written to a temporary file in the same directory, flushed, optionally validated,
 backed up, and atomically replaced. A failed candidate validation leaves the
-original CSV unchanged.
+original CSV unchanged. CSV rows with missing or extra columns are rejected
+before any write. Existing file permissions are preserved; new files use
+`default_file_mode=0o600` unless configured otherwise.
+
+If the replacement succeeds but the parent-directory `fsync` fails, the
+repository raises `CommitDurabilityError` and explicitly reports that the file
+may already be committed. Callers must inspect the file before retrying.
 
 The repository expects the CSV file to exist before the first read or write. The
 caller owns initial file creation and schema migration. `update()` never performs

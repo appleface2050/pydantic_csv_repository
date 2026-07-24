@@ -25,6 +25,10 @@ class DataValidationError(RepositoryError):
     """The current or candidate data failed storage or domain validation."""
 
 
+class CommitDurabilityError(RepositoryError):
+    """The replacement completed, but durable directory sync failed."""
+
+
 class Repository(Protocol, Generic[RecordT, RecordIdT]):
     """Minimal CRUD interface for one record type."""
 

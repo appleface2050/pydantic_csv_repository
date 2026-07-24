@@ -1,13 +1,19 @@
-"""Behaviour tests for the public CsvRepository implementation."""
+"""Behaviour and safety tests for the public CsvRepository implementation."""
 
+import json
+import multiprocessing
+import os
 from pathlib import Path
+from stat import S_IMODE
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from pydantic_csv_repository import (
+    CommitDurabilityError,
     CsvRepository,
     DataValidationError,
+    FieldCodec,
     FrictionlessResourceValidator,
     RecordConflictError,
     RecordNotFoundError,
@@ -22,6 +28,28 @@ class Item(BaseModel):
     value: float
 
 
+class ValidatedItem(BaseModel):
+    """Record whose field validator must run after ID assignment."""
+
+    id: int = 0
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_empty(cls, value: str) -> str:
+        if not value:
+            raise ValueError("name cannot be empty")
+        return value
+
+
+class NullableItem(BaseModel):
+    """Record used to verify explicit codecs for nullable and structured fields."""
+
+    id: int = 0
+    note: int | None = None
+    tags: list[str] = []
+
+
 SCHEMA = {
     "fields": [
         {"name": "id", "type": "integer", "constraints": {"required": True}},
@@ -32,19 +60,44 @@ SCHEMA = {
 }
 
 
-def _build_repository(path: Path, *, validator=None, backup_limit: int = 20):
+def _build_repository(
+    path: Path,
+    *,
+    validator=None,
+    backup_limit: int = 20,
+    id_factory=None,
+):
     return CsvRepository(
         path=path,
         model_type=Item,
         fieldnames=("id", "name", "value"),
         id_field="id",
-        id_factory=lambda records: max((item.id for item in records), default=0) + 1,
+        id_factory=id_factory or (lambda records: max((item.id for item in records), default=0) + 1),
         is_empty_id=lambda record_id: record_id == 0,
         unique_keys=(("name",),),
         sort_key=lambda item: item.id,
         candidate_validator=validator,
         backup_limit=backup_limit,
     )
+
+
+def _build_nullable_repository(path: Path, *, field_codecs=None):
+    return CsvRepository(
+        path=path,
+        model_type=NullableItem,
+        fieldnames=("id", "note", "tags"),
+        id_field="id",
+        id_factory=lambda records: max((item.id for item in records), default=0) + 1,
+        is_empty_id=lambda record_id: record_id == 0,
+        sort_key=lambda item: item.id,
+        field_codecs=field_codecs,
+    )
+
+
+def _create_item_in_process(path: str, name: str) -> None:
+    """Create one item from a separate process for the flock regression test."""
+    repository = _build_repository(Path(path), backup_limit=0)
+    repository.create(Item(name=name, value=1))
 
 
 def test_crud_uses_stable_ids_and_persists_valid_csv(tmp_path):
@@ -128,3 +181,159 @@ def test_write_keeps_only_configured_number_of_backups(tmp_path):
 
     backup_dir = tmp_path / ".backups" / "items"
     assert len(list(backup_dir.glob("*.csv"))) == 2
+
+
+def test_create_rejects_invalid_generated_id(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n", encoding="utf-8")
+    repository = _build_repository(path, id_factory=lambda _records: "not-an-int")
+
+    with pytest.raises(DataValidationError, match="Record validation failed"):
+        repository.create(Item(name="alpha", value=1))
+
+    assert repository.all() == []
+
+
+def test_model_instance_is_revalidated_before_create(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name\n", encoding="utf-8")
+    repository = CsvRepository(
+        path=path,
+        model_type=ValidatedItem,
+        fieldnames=("id", "name"),
+        id_field="id",
+        id_factory=lambda records: max((item.id for item in records), default=0) + 1,
+        is_empty_id=lambda record_id: record_id == 0,
+    )
+    invalid_record = ValidatedItem.model_construct(id=1, name="")
+
+    with pytest.raises(DataValidationError, match="Record validation failed"):
+        repository.create(invalid_record)
+
+    assert repository.all() == []
+
+
+def test_update_revalidates_model_after_forcing_id(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name\n1,alpha\n", encoding="utf-8")
+    repository = CsvRepository(
+        path=path,
+        model_type=ValidatedItem,
+        fieldnames=("id", "name"),
+        id_field="id",
+        id_factory=lambda records: max((item.id for item in records), default=0) + 1,
+        is_empty_id=lambda record_id: record_id == 0,
+    )
+    invalid_record = ValidatedItem.model_construct(id=0, name="")
+
+    with pytest.raises(DataValidationError, match="Record validation failed"):
+        repository.update(1, invalid_record)
+
+    assert repository.all() == [ValidatedItem(id=1, name="alpha")]
+
+
+def test_nullable_and_structured_fields_require_explicit_codecs(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,note,tags\n", encoding="utf-8")
+    repository = _build_nullable_repository(path)
+
+    with pytest.raises(DataValidationError, match="requires an explicit codec"):
+        repository.create(NullableItem(note=None, tags=["alpha"]))
+
+
+def test_json_codecs_preserve_nullable_and_structured_values(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,note,tags\n", encoding="utf-8")
+    json_codec = FieldCodec(
+        encode=lambda value: json.dumps(value, ensure_ascii=False),
+        decode=json.loads,
+    )
+    repository = _build_nullable_repository(
+        path,
+        field_codecs={"note": json_codec, "tags": json_codec},
+    )
+
+    created = repository.create(NullableItem(note=None, tags=["alpha", "beta"]))
+
+    assert repository.all() == [created]
+    assert repository.all()[0].note is None
+    assert repository.all()[0].tags == ["alpha", "beta"]
+
+
+def test_read_rejects_extra_csv_columns_before_any_write(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n1,alpha,1,UNSEEN\n", encoding="utf-8")
+    repository = _build_repository(path)
+
+    with pytest.raises(DataValidationError, match="extra columns"):
+        repository.all()
+
+
+def test_read_rejects_missing_csv_columns(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n1,alpha\n", encoding="utf-8")
+    repository = _build_repository(path)
+
+    with pytest.raises(DataValidationError, match="missing columns"):
+        repository.all()
+
+
+def test_directory_fsync_failure_reports_uncertain_commit(tmp_path, monkeypatch):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n", encoding="utf-8")
+    repository = _build_repository(path)
+
+    def fail_fsync():
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(repository, "_fsync_parent_directory", fail_fsync)
+
+    with pytest.raises(CommitDurabilityError, match="may already be committed"):
+        repository.create(Item(name="alpha", value=1))
+
+    assert repository.all() == [Item(id=1, name="alpha", value=1)]
+
+
+def test_existing_file_mode_is_preserved(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n", encoding="utf-8")
+    os.chmod(path, 0o640)
+    repository = _build_repository(path)
+
+    repository.create(Item(name="alpha", value=1))
+
+    assert S_IMODE(path.stat().st_mode) == 0o640
+
+
+def test_replace_all_returns_sorted_normalized_snapshot(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n", encoding="utf-8")
+    repository = _build_repository(path)
+
+    persisted = repository.replace_all(
+        [Item(id=2, name="beta", value=2), Item(id=1, name="alpha", value=1)]
+    )
+
+    assert persisted == repository.all()
+    assert [item.id for item in persisted] == [1, 2]
+
+
+@pytest.mark.skipif(not hasattr(multiprocessing, "get_context"), reason="POSIX process test")
+def test_concurrent_process_creates_keep_unique_ids(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n", encoding="utf-8")
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(target=_create_item_in_process, args=(str(path), f"item-{index}"))
+        for index in range(4)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+
+    assert all(process.exitcode == 0 for process in processes)
+    records = _build_repository(path, backup_limit=0).all()
+    assert len(records) == 4
+    assert {record.id for record in records} == {1, 2, 3, 4}

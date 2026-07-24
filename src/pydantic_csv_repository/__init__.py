@@ -1,7 +1,8 @@
 """Safe local CSV persistence for Pydantic models."""
 
-from pydantic_csv_repository.csv_repository import CsvRepository
+from pydantic_csv_repository.csv_repository import CsvRepository, FieldCodec
 from pydantic_csv_repository.repository import (
+    CommitDurabilityError,
     DataValidationError,
     RecordConflictError,
     RecordNotFoundError,
@@ -11,6 +12,8 @@ from pydantic_csv_repository.repository import (
 
 __all__ = [
     "CsvRepository",
+    "FieldCodec",
+    "CommitDurabilityError",
     "DataValidationError",
     "RecordConflictError",
     "RecordNotFoundError",
