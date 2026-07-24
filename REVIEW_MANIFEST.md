@@ -1,7 +1,7 @@
 # External Review Manifest
 
-- Archive commit: `6bbfe7f` (code snapshot represented by this archive)
-- Code commit: `6bbfe7f`
+- Archive commit: `6bbfe7f4374cb94296bbdba59faaf95a447922b5` (code snapshot represented by this archive)
+- Code commit: `6bbfe7f4374cb94296bbdba59faaf95a447922b5`
 - GitHub: `appleface2050/pydantic_csv_repository`
 - Package version: `0.1.0` (not released to PyPI)
 - Requirements: Python `>=3.10`, Linux/macOS, Pydantic 2.x
