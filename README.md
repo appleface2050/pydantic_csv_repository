@@ -16,6 +16,8 @@ The package is intentionally domain-agnostic. Callers provide the Pydantic model
 CSV fields, ID policy, sort order, and optional candidate validator. For the
 0.1.x contract, `fieldnames` must exactly cover `model_type.model_fields`; fields
 cannot be silently omitted or added as unknown CSV columns.
+Models with Pydantic field aliases or validation aliases are rejected during
+construction in 0.1.x; use ordinary model field names for the persisted schema.
 
 ## Requirements
 
@@ -70,6 +72,10 @@ created = repository.create(Item(name="alpha", value=1.5))
 assert created.id == 1
 assert repository.get(1) == created
 ```
+
+The `id_factory` receives an immutable tuple of deep-copied records. ID factories,
+ID predicates, sort keys, codecs, and candidate validators should be deterministic
+and side-effect free.
 
 ## Field codecs
 

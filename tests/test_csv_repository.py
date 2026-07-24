@@ -7,7 +7,7 @@ from pathlib import Path
 from stat import S_IMODE
 
 import pytest
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from pydantic_csv_repository import (
     CommitDurabilityError,
@@ -47,7 +47,7 @@ class NullableItem(BaseModel):
 
     id: int = 0
     note: int | None = None
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
 
 
 class TextItem(BaseModel):
@@ -71,6 +71,13 @@ class DefaultedFieldItem(BaseModel):
     id: int = 0
     name: str
     metadata: str = "default"
+
+
+class AliasItem(BaseModel):
+    """Record used to verify the explicit alias limitation."""
+
+    id: int = 0
+    name: str = Field(alias="display_name")
 
 
 SCHEMA = {
@@ -217,6 +224,35 @@ def test_create_rejects_invalid_generated_id(tmp_path):
     assert repository.all() == []
 
 
+def test_id_factory_cannot_clear_repository_snapshot(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n1,old,1\n", encoding="utf-8")
+
+    def destructive_factory(records):
+        records.clear()
+        return 2
+
+    repository = _build_repository(path, id_factory=destructive_factory)
+    with pytest.raises(DataValidationError, match="id_factory failed"):
+        repository.create(Item(name="new", value=2))
+
+    assert repository.all() == [Item(id=1, name="old", value=1)]
+
+
+def test_id_factory_cannot_mutate_existing_record_objects(tmp_path):
+    path = tmp_path / "items.csv"
+    path.write_text("id,name,value\n1,old,1\n", encoding="utf-8")
+
+    def mutating_factory(records):
+        records[0].name = "mutated"
+        return 2
+
+    repository = _build_repository(path, id_factory=mutating_factory)
+    repository.create(Item(name="new", value=2))
+
+    assert repository.all()[0] == Item(id=1, name="old", value=1)
+
+
 def test_model_instance_is_revalidated_before_create(tmp_path):
     path = tmp_path / "items.csv"
     path.write_text("id,name\n", encoding="utf-8")
@@ -357,6 +393,18 @@ def test_fieldnames_must_exactly_cover_model_fields(tmp_path, model_type, fieldn
             path=tmp_path / "items.csv",
             model_type=model_type,
             fieldnames=fieldnames,
+            id_field="id",
+            id_factory=lambda records: 1,
+            is_empty_id=lambda record_id: record_id == 0,
+        )
+
+
+def test_alias_models_are_rejected_at_construction(tmp_path):
+    with pytest.raises(ValueError, match="fields with aliases are not supported"):
+        CsvRepository(
+            path=tmp_path / "items.csv",
+            model_type=AliasItem,
+            fieldnames=("id", "name"),
             id_field="id",
             id_factory=lambda records: 1,
             is_empty_id=lambda record_id: record_id == 0,

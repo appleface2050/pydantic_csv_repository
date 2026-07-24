@@ -69,6 +69,18 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
         normalized_fieldnames = tuple(fieldnames)
         if not isinstance(model_type, type) or not issubclass(model_type, BaseModel):
             raise ValueError("model_type must be a Pydantic BaseModel subclass")
+        aliased_fields = sorted(
+            field_name
+            for field_name, field_info in model_type.model_fields.items()
+            if field_info.alias not in (None, field_name)
+            or field_info.validation_alias is not None
+            or field_info.serialization_alias not in (None, field_name)
+        )
+        if aliased_fields:
+            raise ValueError(
+                "model_type fields with aliases are not supported: "
+                f"{aliased_fields}"
+            )
         model_fields = set(model_type.model_fields)
         if not normalized_fieldnames:
             raise ValueError("fieldnames cannot be empty")
@@ -156,7 +168,11 @@ class CsvRepository(Generic[ModelT, RecordIdT]):
             normalized_record = self._normalize_record(record)
             record_id = getattr(normalized_record, self.id_field)
             if self.is_empty_id(record_id):
-                generated_id = self.id_factory(records)
+                factory_snapshot = tuple(record.model_copy(deep=True) for record in records)
+                try:
+                    generated_id = self.id_factory(factory_snapshot)
+                except Exception as exc:
+                    raise DataValidationError(f"id_factory failed: {exc}") from exc
                 normalized_record = self._with_updates(
                     normalized_record,
                     {self.id_field: generated_id},
